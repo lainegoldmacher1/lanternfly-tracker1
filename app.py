@@ -1,62 +1,66 @@
 import os
-from flask import Flask, request, jsonify, render_template
-from azure.storage.blob import BlobServiceClient, ContentSettings
 from datetime import datetime
-from werkzeug.utils import secure_filename
-from dotenv import load_dotenv
+from flask import Flask, request, jsonify, render_template
+from azure.storage.blob import BlobServiceClient, ContentSettings, PublicAccess
 
-load_dotenv()
+# Config
+STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+CONTAINER_NAME = "lanternfly-images"
 
+# Initialize Azure
+bsc = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+cc = bsc.get_container_client(CONTAINER_NAME)
+
+# Create the container if it doesn’t exist
+try:
+    cc.create_container(public_access=PublicAccess.Container)
+except Exception:
+    pass  # Container likely exists
+
+# Flask app
 app = Flask(__name__)
 
-# Load config from environment
-STORAGE_ACCOUNT_URL = os.getenv("STORAGE_ACCOUNT_URL")
-IMAGES_CONTAINER = os.getenv("IMAGES_CONTAINER")
-CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+@app.route("/")
+def index():
+    return render_template("gallery.html")
 
-# Connect to Azure Blob Storage
-bsc = BlobServiceClient.from_connection_string(CONNECTION_STRING)
-cc = bsc.get_container_client(IMAGES_CONTAINER)
-
-@app.route("/api/v1/upload", methods=["POST"])
+@app.post("/api/v1/upload")
 def upload():
     try:
-        f = request.files.get("file")
+        f = request.files["file"]
         if not f:
-            return jsonify(ok=False, error="Missing file"), 400
+            return jsonify(ok=False, error="No file provided"), 400
 
-        if not f.content_type.startswith("image/"):
-            return jsonify(ok=False, error="Only image uploads allowed"), 400
+        if not f.mimetype.startswith("image/"):
+            return jsonify(ok=False, error="Only image files allowed"), 400
 
-        if len(f.read()) > 10 * 1024 * 1024:
-            return jsonify(ok=False, error="File too large (max 10MB)"), 400
-        f.seek(0)
+        # Sanitize + timestamp filename
+        safe_name = f.filename.replace(" ", "_")
+        blob_name = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}-{safe_name}"
 
-        filename = secure_filename(f.filename)
-        blob_name = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}-{filename}"
         blob_client = cc.get_blob_client(blob_name)
         blob_client.upload_blob(
-            f,
+            f.read(),
             overwrite=True,
-            content_settings=ContentSettings(content_type=f.content_type)
+            content_settings=ContentSettings(content_type=f.mimetype)
         )
-        return jsonify(ok=True, url=blob_client.url)
+
+        url = f"{blob_client.url}"
+        return jsonify(ok=True, url=url)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
-@app.route("/api/v1/gallery", methods=["GET"])
+
+@app.get("/api/v1/gallery")
 def gallery():
     try:
-        urls = [f"{STORAGE_ACCOUNT_URL}/{IMAGES_CONTAINER}/{blob.name}" for blob in cc.list_blobs()]
+        urls = [f"{cc.url}/{b.name}" for b in cc.list_blobs()]
         return jsonify(ok=True, gallery=urls)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
-@app.route("/")
-def index():
-    return render_template("index.html")
 
-@app.route("/health")
+@app.get("/api/v1/health")
 def health():
-    return "OK", 200
+    return jsonify(ok=True)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000)
